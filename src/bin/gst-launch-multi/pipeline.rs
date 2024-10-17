@@ -32,7 +32,6 @@ pub(crate) struct Pipeline {
 }
 
 impl Pipeline {
-
     pub(crate) fn new(
         config: &cli::PipelineConfig,
         clock: Option<&gst::Clock>,
@@ -52,8 +51,6 @@ impl Pipeline {
         pipeline.set_start_time(gst::ClockTime::NONE);
         pipeline.set_base_time(basetime.to_owned());
 
-        // let p = 
-
         Ok(Arc::new(Self {
             config: config.to_owned(),
             pipeline,
@@ -63,30 +60,135 @@ impl Pipeline {
         }))
     }
 
-    pub(crate) fn start(&self) -> Result<()> {
+    pub(crate) fn start(self: &Arc<Self>) -> Result<()> {
         self.pipeline.set_state(gst::State::Playing)?;
         Ok(())
     }
 
-    pub(crate) fn start_arc(self: &Arc<Self>) -> Result<()> {
-        self.pipeline.set_state(gst::State::Playing)?;
-        Ok(())
-    }
-
-    pub(crate) fn stop(&self) -> Result<()> {
+    pub(crate) fn stop(self: &Arc<Self>) -> Result<()> {
         self.pipeline.set_state(gst::State::Null)?;
         Ok(())
     }
 
-    pub(crate) fn stop_arc(self: &Arc<Self>) -> Result<()> {
-        self.pipeline.set_state(gst::State::Null)?;
-        Ok(())
+    fn signal_stop(self: &Arc<Self>) {
+        // send an EOS event which is processed in the bus event loop task (below)
+        // where the pipeline is stopped.
+        let eos_event = gst::event::Eos::new();
+        let _ = self.pipeline.send_event(eos_event);
+
+        // mark the pipeline as being stopped manually via CLI
+        {
+            let mut shared_settings = self.shared_settings.lock().unwrap();
+            shared_settings.cli_stopped = true;
+        }
     }
 
-    pub(crate) async fn run(self: &Arc<Self>,
+    /// Handle a command
+    /// 
+    /// Return Ok(true) if the pipeline should be stopped.
+    fn handle_command(self: &Arc<Self>, command: cli::SubCommand) -> Result<bool> {
+        match command {
+            cli::SubCommand::SetProperty(args) => {
+                if self.config.name == args.pipeline {
+                    println!("Set property: {}: {:?}", self.config.name, args);
+                    if let Some(element) = self.pipeline.by_name(&args.element) {
+                        element.set_property_from_str(&args.property, &args.value);
+                    }
+                }
+
+                Ok(false)
+            }
+            cli::SubCommand::SwitchPad(args) => {
+                if self.config.name == args.pipeline {
+                    println!("Switch pad: {}: {:?}", self.config.name, args);
+                    if let Some(element) = self.pipeline.by_name(&args.element) {
+                        // TODO: should check the class of the element is "input-selector"
+                        if let Some(pad) = element.static_pad(&args.pad) {
+                            element.set_property("active-pad", pad);
+                        }
+                    }
+                }
+                Ok(false)
+            }
+            cli::SubCommand::StopPipeline(args) => {
+                let found = args
+                    .pipelines
+                    .iter()
+                    .find(|pipeline_name| pipeline_name.as_str() == self.config.name);
+
+                if found.is_some() {
+                    println!("Stop pipeline: {}", self.config.name);
+                    
+                    self.signal_stop();
+
+                    // The pipeline is stopped now.
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            cli::SubCommand::Exit => {
+                self.signal_stop();
+
+                // Signal the caller that the pipeline should be stopped
+                Ok(true)
+            }
+            cli::SubCommand::PushLatencyEvent(args) => {
+                if self.config.name == args.pipeline {
+                    println!("{}: Pushing latency message to bus", self.config.name);
+
+                    let msg = gst::message::Latency::builder().build();
+                    let _ = self.pipeline.post_message(msg);
+                }
+                Ok(false)
+            }
+            cli::SubCommand::SetLatency(args) => {
+                if self.config.name == args.pipeline {
+                    let latency_event =
+                        gst::event::Latency::new(gst::ClockTime::from_mseconds(args.latency_ms));
+
+                    if let Some(element_name) = args.element {
+                        if let Some(element) = self.pipeline.by_name(&element_name) {
+                            let _ = element.send_event(latency_event);
+                        }
+                    } else {
+                        let _ = self.pipeline.send_event(latency_event);
+                    }
+                }
+                Ok(false)
+            }
+            cli::SubCommand::GetLatency(args) => {
+                if self.config.name == args.pipeline {
+
+                    let mut query = gst::query::Latency::new();
+
+                    if let Some(element_name) = args.element {
+                        if let Some(element) = self.pipeline.by_name(&element_name) {
+                            let _ = element.query(&mut query);
+                        }
+                    } else {
+                        let _ = self.pipeline.query(query.query_mut());
+                    }
+
+                    if let gst::QueryView::Latency(latency) = query.view() {
+                        let (is_live, min_latency, max_latency) = latency.result();
+                        println!("{}: Latency: is_live: {is_live}, min_latency: {min_latency}, max_latency: {max_latency:?}", self.config.name);
+                    }
+                }
+                Ok(false)
+            }
+            _ => {
+                Ok(false)
+            }
+        }
+
+    }
+
+    pub(crate) async fn run(
+        self: &Arc<Self>,
         mut _shutdown_receiver: broadcast::Receiver<()>,
-        mut command_receiver: broadcast::Receiver<cli::SubCommand>) -> Result<()> {
-
+        mut command_receiver: broadcast::Receiver<cli::SubCommand>,
+    ) -> Result<()> {
         // first, change the pipeline state to PLAYING
         self.start()?;
 
@@ -95,129 +197,33 @@ impl Pipeline {
         let mut task_set = tokio::task::JoinSet::new();
 
         ///////////////////////////////////////////////////////
-    // CLI command task
-    let pipeline_command_clone = self.clone();
-    task_set.spawn(async move {
-        let pipeline = pipeline_command_clone;
+        // CLI command task
+        let pipeline_command_clone = self.clone();
+        let mut shutdown_command_clone = _shutdown_receiver.resubscribe();
+        task_set.spawn(async move {
+            let pipeline = pipeline_command_clone;
 
-        while let Ok(command) = command_receiver.recv().await {
-            match command {
-                cli::SubCommand::SetProperty(args) => {
-                    if pipeline.config.name == args.pipeline {
-                        println!("Set property: {}: {:?}", pipeline.config.name, args);
-                        if let Some(element) = pipeline.pipeline.by_name(&args.element) {
-                            element.set_property_from_str(&args.property, &args.value);
-                        }
-                    }
-                }
-                cli::SubCommand::SwitchPad(args) => {
-                    if pipeline.config.name == args.pipeline {
-                        println!("Switch pad: {}: {:?}", pipeline.config.name, args);
-                        if let Some(element) = pipeline.pipeline.by_name(&args.element) {
-                            // TODO: should check the class of the element is "input-selector"
-                            if let Some(pad) = element.static_pad(&args.pad) {
-                                element.set_property("active-pad", pad);
-                            }
-                        }
-                    }
-                }
-                cli::SubCommand::StopPipeline(args) => {
-                    let found = args
-                        .pipelines
-                        .iter()
-                        .find(|pipeline_name| pipeline_name.as_str() == pipeline.config.name);
-
-                    if found.is_some() {
-                        println!("Stop pipeline: {}", pipeline.config.name);
-                        // send an EOS event which is processed in the bus event loop task (below)
-                        // where the pipeline is stopped and.
-                        let eos_event = gst::event::Eos::new();
-
-                        // mark the pipeline as being stopped manually via CLI
-                        {
-                            let mut shared_settings = pipeline.shared_settings.lock().unwrap();
-                            shared_settings.cli_stopped = true;
-                        }
-
-                        let _ = pipeline.pipeline.send_event(eos_event);
-
-                        // break the CLI loop, completing this task
+            loop {
+                tokio::select! {
+                    _ = shutdown_command_clone.recv() => {
+                        // signal the pipeline to stop, then break this loop to complete the CLI task
+                        pipeline.signal_stop();
                         break;
-                    }
-                }
-                cli::SubCommand::Exit => {
-                    // send an EOS event which is processed in the bus event loop task (below)
-                    // where the pipeline is stopped.
-                    let eos_event = gst::event::Eos::new();
-                    let _ = pipeline.pipeline.send_event(eos_event);
-
-                    // break the CLI loop, completing this task
-                    break;
-                }
-                cli::SubCommand::PushLatencyEvent(args) => {
-                    if pipeline.config.name == args.pipeline {
-                        println!("Push latency event: {}", pipeline.config.name);
-                        // let latency_event = gst::event::Latency::new(gst::ClockTime::from_mseconds(args.latency_ms));
-
-                        let msg = gst::message::Latency::builder().build();
-                        let _ = pipeline.pipeline.post_message(msg);
-
-                        
-                    }
-                }
-                cli::SubCommand::SetLatency(args) => {
-                    if pipeline.config.name == args.pipeline {
-
-                        let latency_event = gst::event::Latency::new(gst::ClockTime::from_mseconds(args.latency_ms));
-
-                        if let Some(element_name) = args.element {
-                            if let Some(element) = pipeline.pipeline.by_name(&element_name) {
-                                let _ = element.send_event(latency_event);
-                            }
-                        }
-                        else {
-                            let _ = pipeline.pipeline.send_event(latency_event);
+                    },
+                    Ok(command) = command_receiver.recv() => {
+                        let should_break = pipeline.handle_command(command);
+                        if let Ok(true) = should_break {
+                            break;
                         }
                     }
                 }
-                cli::SubCommand::GetLatency(args) => {
-                    if pipeline.config.name == args.pipeline {
-                        println!("Get latency: {}", pipeline.config.name);
-                        
-                        let mut query = gst::query::Latency::new();
-
-                        if let Some(element_name) = args.element {
-                            if let Some(element) = pipeline.pipeline.by_name(&element_name) {
-                                let _ = element.query(&mut query);
-                            }
-                        } else {
-                            let _ = pipeline.pipeline.query(query.query_mut());
-                        }
-                        
-
-                        if let gst::QueryView::Latency(latency) = query.view() {
-                            let (is_live, min_latency, max_latency) = latency.result();
-                            println!("Latency: is_live: {is_live}, min_latency: {min_latency}, max_latency: {max_latency:?}");
-                        }
-
-                        // match query.view() {
-                        //     gst::QueryView::Latency(latency) => {
-                        //         println!("Latency: {:?}", latency);
-                        //     }
-                        //     _ => {}
-                        // }
-                        // println!("Latency: {:?}", query);
-                    }
-                }
-                _ => {}
             }
-        }
-    });
+        });
 
-    ///////////////////////////////////////////////////////
-    // Bus message handling task
-    let pipeline_bus_task_clone = self.clone();
-    task_set.spawn(async move {
+        ///////////////////////////////////////////////////////
+        // Bus message handling task
+        let pipeline_bus_task_clone = self.clone();
+        task_set.spawn(async move {
         
         let pipeline = pipeline_bus_task_clone;
 
@@ -241,6 +247,10 @@ impl Pipeline {
                         // the pipeline_clone is moved into this closure
                         match probe_info.data {
                             Some(gst::PadProbeData::Event(ref event)) => match event.view() {
+                                gst::EventView::Latency(latency) => {
+                                    println!("{pipeline_name}: intersrc latency event: {latency:?}");
+                                    gst::PadProbeReturn::Pass
+                                }
                                 gst::EventView::Eos(_) => {
 
                                     let pad_return = {
@@ -264,7 +274,7 @@ impl Pipeline {
                                     };
 
                                     println!(
-                                        "Pipeline: {pipeline_name} EOS on intersrc element: {element_name}, pad_return: {pad_return:?}",
+                                        "{pipeline_name}: EOS on intersrc element: {element_name}, pad_return: {pad_return:?}",
                                     );
                                     pad_return
                                 }
@@ -283,7 +293,7 @@ impl Pipeline {
                 match msg.view() {
                     gst::MessageView::Eos(msg) => {
                         println!(
-                            "Pipeline: {}: End-Of-Stream reached: {:?}",
+                            "{}: End-Of-Stream: {:?}",
                             pipeline.config.name, msg
                         );
                         // stop the pipeline and break the loop
@@ -292,14 +302,14 @@ impl Pipeline {
                     }
                     gst::MessageView::Error(err) => {
                         println!(
-                            "Pipeline: {}: Error received from element {:?}",
+                            "{}: Error message: {:?}",
                             pipeline.config.name,
                             err.message()
                         );
                     }
                     gst::MessageView::Latency(msg) => {
                         println!(
-                            "Pipeline: {}: Latency message received {msg:?}",
+                            "{}: Latency message: {msg:?}",
                             pipeline.config.name
                         );
 
@@ -307,16 +317,10 @@ impl Pipeline {
                         let _ = pipeline.pipeline.query(query.query_mut());
                         if let gst::QueryView::Latency(latency) = query.view() {
                             let (is_live, min_latency, max_latency) = latency.result();
-                            println!("Pipeline: {}: Latency before recalculation : is_live: {is_live}, min_latency: {min_latency}, max_latency: {max_latency:?}", pipeline.config.name);
+                            println!("{}: Latency: is_live: {is_live}, min_latency: {min_latency}, max_latency: {max_latency:?}", pipeline.config.name);
                         }
 
                         let _ = pipeline.pipeline.recalculate_latency();
-
-                        let _ = pipeline.pipeline.query(query.query_mut());
-                        if let gst::QueryView::Latency(latency) = query.view() {
-                            let (is_live, min_latency, max_latency) = latency.result();
-                            println!("Pipeline: {}: Latency after recalculation : is_live: {is_live}, min_latency: {min_latency}, max_latency: {max_latency:?}", pipeline.config.name);
-                        }
                     }
                     _ => {}
                 }
@@ -329,8 +333,8 @@ impl Pipeline {
         }
     });
 
-    // wait for all the tasks controlling the pipeline to finish
-    while task_set.join_next().await.is_some() {}
+        // wait for all the tasks controlling the pipeline to finish
+        while task_set.join_next().await.is_some() {}
         Ok(())
     }
 }

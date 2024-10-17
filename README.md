@@ -1,6 +1,21 @@
 # gst-launch-multi
 A gstreamer pipeline launcher supporting multiple pipelines
 
+## Gst Rust plugin
+
+```bash
+cd local
+git clone --depth 1 --branch gstreamer-1.24.2 https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git
+cd gst-plugins-rs
+cargo build --release
+# release
+cp target/release/*.so /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0/
+# debug
+cp target/debug/*.so /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0/
+
+cargo build; cp target/debug/*.so /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0/
+```
+
 ## TODOs
 
 * Refactor to use `Arc<Pipeline>`.
@@ -38,17 +53,23 @@ gst-launch-1.0 \
   ! queue ! mpegtsmux alignment=7 name=mux \
   ! queue ! srtsink uri=srt://:7000?mode=listener wait-for-connection=false poll-timeout=-1
 
+export GST_DEBUG="intersink:4,utilsrs-stream-producer:4"
 cargo run --bin gst-launch-multi -- \
   --pipeline --name ingress uridecodebin uri=srt://127.0.0.1:7000?mode=caller name=decoder \
-    decoder. ! video/x-raw ! queue ! videoconvert ! clockoverlay valignment=top ! textoverlay text=Ingress valignment=top ! tee name=video_tee ! queue ! autovideosink video_tee. ! queue ! intersink producer-name=ingress_raw_video \
+    decoder. ! video/x-raw ! queue ! videoconvert ! clockoverlay valignment=5 ypos=0.1 ! textoverlay text=Ingress valignment=5 ypos=0.1 ! tee name=video_tee ! queue ! autovideosink video_tee. ! queue ! intersink producer-name=ingress_raw_video \
   \
-  --pipeline --name video_link_0 intersrc name=ingress_raw_video producer-name=ingress_raw_video ! queue name=ingress_raw_video_queue max-size-bytes=104857600 max-size-time=10000000000 min-threshold-time=1000000000 ! videoscale ! videoconvert ! clockoverlay valignment=center ! textoverlay text="video_link_0" valignment=center ! tee name=video_tee ! queue ! videoconvert ! autovideosink video_tee. ! queue ! intersink producer-name=video_link_0 \
+  --pipeline --name video_link_0 intersrc name=ingress_raw_video producer-name=ingress_raw_video ! queue name=ingress_raw_video_queue max-size-bytes=104857600 max-size-time=20000000000 min-threshold-time=1000000000 ! videoscale ! videoconvert ! clockoverlay valignment=5 ypos=0.25 ! textoverlay text="video_link_0" valignment=5 ypos=0.25 ! tee name=video_tee ! queue ! videoconvert ! autovideosink video_tee. ! queue ! intersink producer-name=video_link_0 \
   \
-  --pipeline --name video_link_1 intersrc name=video_link_0 producer-name=video_link_0 ! queue name=ingress_raw_video_queue max-size-bytes=104857600 max-size-time=10000000000 min-threshold-time=1000000000 ! videoscale ! videoconvert ! clockoverlay valignment=bottom ! textoverlay text="video_link_1" valignment=bottom ! tee name=video_tee ! queue ! videoconvert ! autovideosink video_tee. ! queue ! intersink producer-name=video_link_1
+  --pipeline --name video_link_1 intersrc name=video_link_0 producer-name=video_link_0 ! queue name=ingress_raw_video_queue max-size-bytes=104857600 max-size-time=20000000000 min-threshold-time=1000000000 ! videoscale ! videoconvert ! clockoverlay valignment=5 ypos=0.4 ! textoverlay text="video_link_1" valignment=5 ypos=0.4 ! tee name=video_tee ! queue ! videoconvert ! autovideosink video_tee. ! queue ! intersink producer-name=video_link_1 \
+  \
+  --pipeline --name video_link_2 intersrc name=video_link_1 producer-name=video_link_1 ! queue name=ingress_raw_video_queue max-size-bytes=104857600 max-size-time=20000000000 min-threshold-time=1000000000 ! videoscale ! videoconvert ! clockoverlay valignment=5 ypos=0.55 ! textoverlay text="video_link_2" valignment=5 ypos=0.55 ! tee name=video_tee ! queue ! videoconvert ! autovideosink video_tee. ! queue ! intersink producer-name=video_link_2
 
 set-property --pipeline video_link_0 --element ingress_raw_video_queue --property min-threshold-time --value 3000000000
 
+get-latency --pipeline ingress
 get-latency --pipeline video_link_0
+get-latency --pipeline video_link_1
+get-latency --pipeline video_link_2
 push-latency-event --pipeline video_link_0
 
 

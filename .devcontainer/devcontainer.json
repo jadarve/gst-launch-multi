@@ -1,0 +1,59 @@
+{
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "name": "gst-launch-multi",
+  "forwardPorts": [
+    9089
+  ],
+  "appPort": [
+    "7000:7000/udp",
+    "7001:7001/udp",
+  ],
+  "privileged": true,
+  "mounts": [
+    { "source": "/var/run/docker.sock", "target": "/var/run/docker.sock", "type": "bind" },
+    { "source": "${localWorkspaceFolder}", "target": "${localWorkspaceFolder}", "type": "bind" },
+    { "source": "/tmp/.X11-unix", "target": "/tmp/.X11-unix", "type": "bind" },
+    // Change according to your setup
+    {
+      "source": "/home/juan/workspace/video-engineering/recordings/frame_interactivity/20240825-ARIatDEN",
+      "target": "/usr/local/streaming",
+      "type": "bind"
+    }
+  ],
+  "containerEnv": {
+    "TEST_HOST": "host.docker.internal",
+    "DISPLAY": ":0"
+
+  },
+  "runArgs": [
+    "--add-host=host.docker.internal:host-gateway"
+  ],
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "lldb.executable": "/usr/bin/lldb",
+        "files.watcherExclude": {
+          "**/target/**": true
+        },
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer",
+          "editor.formatOnSave": true
+        }
+      },
+      "extensions": [
+        "codeium.codeium",
+        "ms-azuretools.vscode-docker",
+        "ms-vscode.cpptools-extension-pack",
+        "mutantdino.resourcemonitor",
+        "rust-lang.rust-analyzer",
+        "serayuzgur.crates",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ]
+    }
+  }
+}

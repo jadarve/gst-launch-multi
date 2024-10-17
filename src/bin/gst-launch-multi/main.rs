@@ -6,7 +6,6 @@ use clap::Parser;
 use gst::glib;
 use gst::prelude::ClockExt;
 
-use pipeline::run_pipeline;
 use tokio::sync::{broadcast, OnceCell};
 
 // It is important that all pipelines share both the same clock and basetime.
